@@ -1,57 +1,38 @@
-# =========================
-# Base image with CUDA + cuDNN
-# =========================
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+# Use an official PyTorch base image with CUDA and Devel tools
+# We need 'devel' to compile nvdiffrast
+FROM pytorch/pytorch:2.4.0-cuda12.4-cudnn9-devel
 
-# =========================
-# System dependencies
-# =========================
+# Set environment variables to avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Install system dependencies
+# git: to clone nvdiffrast
+# libgl1/libglib: for opencv and image processing
+# build-essential: for compiling C++ extensions
 RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-pip \
     git \
-    ffmpeg \
-    libgl1 \
+    build-essential \
+    libgl1-mesa-glx \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# =========================
-# Python setup
-# =========================
-RUN python3 -m pip install --upgrade pip
-
-# =========================
-# Set workdir
-# =========================
+# Set working directory
 WORKDIR /app
 
-# =========================
-# Copy and install Python dependencies
-# =========================
-COPY requirements.prod.txt .
-RUN pip install --no-cache-dir -r requirements.prod.txt
+# Copy requirements first to leverage Docker cache
+COPY requirements.txt .
 
-# =========================
-# Copy application code
-# =========================
+# Install Python dependencies
+# We install nvdiffrast separately to ensure build deps are ready
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the application code
+# This copies src/, configs/, and app.py
 COPY . .
 
-# =========================
-# Environment variables
-# =========================
-ENV PYTHONPATH=/app
-ENV HF_HOME=/app/.cache/huggingface
-ENV TRANSFORMERS_CACHE=/app/.cache/huggingface
-ENV DIFFUSERS_CACHE=/app/.cache/huggingface
-
-# =========================
-# Expose Gradio port
-# =========================
+# Expose the Gradio port
 EXPOSE 43548
 
-# =========================
-# Run the app
-# =========================
-CMD ["python3", "main.py"]
+# Run the application
+CMD ["python", "app.py"]
