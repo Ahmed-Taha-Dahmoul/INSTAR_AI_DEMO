@@ -1,11 +1,11 @@
 import os
-import sys
-import tempfile
 import gc
-import imageio
+import tempfile
 import numpy as np
 import torch
 import rembg
+import imageio
+import gradio as gr
 from PIL import Image
 from torchvision.transforms import v2
 from pytorch_lightning import seed_everything
@@ -14,17 +14,20 @@ from einops import rearrange
 from tqdm import tqdm
 from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
 from huggingface_hub import hf_hub_download
-import gradio as gr
 
-# Ensure we can import from local src
-sys.path.append(os.getcwd())
+# ---------------------------
+# Configuration & Env Setup
+# ---------------------------
+# Disable symlinks for HuggingFace to avoid issues on some filesystems/docker
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 
 #############################################
-# MemoryOptimizedInstantMesh
+# MemoryOptimizedInstantMesh Class
 #############################################
 class MemoryOptimizedInstantMesh:
     def __init__(self, config_path):
-        print(f"Loading config from {config_path}")
+        print(f"Loading configuration from {config_path}...")
         self.config = OmegaConf.load(config_path)
         self.config_name = os.path.basename(config_path).replace('.yaml', '')
         self.model_config = self.config.model_config
@@ -33,26 +36,38 @@ class MemoryOptimizedInstantMesh:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None
         self.pipeline = None
+        print(f"Initialized InstantMesh on device: {self.device}")
 
     def load_pipeline(self):
+        """Load the diffusion pipeline with memory management"""
         if self.pipeline is not None:
             return
+        
         print("Loading Diffusion Pipeline...")
         self.pipeline = DiffusionPipeline.from_pretrained(
             "sudo-ai/zero123plus-v1.2",
             custom_pipeline="zero123plus",
             torch_dtype=torch.float16,
-            trust_remote_code=True  # allow the repo to define its own pipeline class
         )
         self.pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
             self.pipeline.scheduler.config, timestep_spacing='trailing'
         )
+        
+        # Download and load UNet manually to ensure correct weights
+        unet_ckpt_path = hf_hub_download(
+            repo_id="TencentARC/InstantMesh",
+            filename="diffusion_pytorch_model.bin",
+            repo_type="model"
+        )
+        state_dict = torch.load(unet_ckpt_path, map_location='cpu')
+        self.pipeline.unet.load_state_dict(state_dict, strict=True)
         self.pipeline = self.pipeline.to(self.device)
-
-
+        print("Diffusion Pipeline loaded.")
 
     def unload_pipeline(self):
+        """Unload the pipeline and clear GPU memory"""
         if self.pipeline is not None:
+            print("Unloading Diffusion Pipeline to free memory...")
             self.pipeline = self.pipeline.to('cpu')
             del self.pipeline
             self.pipeline = None
@@ -60,8 +75,10 @@ class MemoryOptimizedInstantMesh:
             gc.collect()
 
     def load_model(self):
+        """Load the reconstruction model with memory management"""
         if self.model is not None:
             return
+        
         print("Loading Reconstruction Model...")
         from src.utils.train_util import instantiate_from_config
         model_ckpt_path = hf_hub_download(
@@ -78,9 +95,12 @@ class MemoryOptimizedInstantMesh:
         if self.is_flexicubes:
             self.model.init_flexicubes_geometry(self.device, fovy=30.0)
         self.model = self.model.eval()
+        print("Reconstruction Model loaded.")
 
     def unload_model(self):
+        """Unload the reconstruction model and clear GPU memory"""
         if self.model is not None:
+            print("Unloading Reconstruction Model to free memory...")
             self.model = self.model.to('cpu')
             del self.model
             self.model = None
@@ -88,11 +108,13 @@ class MemoryOptimizedInstantMesh:
             gc.collect()
 
     def remove_background(self, image, session):
+        """Remove background from image using rembg"""
         if isinstance(image, Image.Image):
             image = np.array(image)
         return Image.fromarray(rembg.remove(image, session=session))
 
     def resize_foreground(self, image, scale=0.85):
+        """Resize foreground content"""
         image_arr = np.array(image)
         if image_arr.shape[2] == 4:
             mask = image_arr[:, :, 3] > 0
@@ -117,6 +139,7 @@ class MemoryOptimizedInstantMesh:
         return image
 
     def generate_mvs(self, input_image, sample_steps, sample_seed):
+        """Generate multi-view images with memory cleanup"""
         self.load_pipeline()
         seed_everything(sample_seed)
         try:
@@ -136,7 +159,11 @@ class MemoryOptimizedInstantMesh:
             self.unload_pipeline()
 
     def get_render_cameras(self, batch_size=1, M=120, radius=2.5, elevation=10.0):
-        from src.utils.camera_util import FOV_to_intrinsics, get_circular_camera_poses
+        """Get rendering camera parameters"""
+        from src.utils.camera_util import (
+            FOV_to_intrinsics,
+            get_circular_camera_poses,
+        )
         c2ws = get_circular_camera_poses(M=M, radius=radius, elevation=elevation)
         if self.is_flexicubes:
             cameras = torch.linalg.inv(c2ws)
@@ -149,16 +176,23 @@ class MemoryOptimizedInstantMesh:
         return cameras.to(self.device)
 
     def make3d(self, images):
+        """Generate 3D model with memory optimization"""
         self.load_model()
         try:
             images = np.asarray(images, dtype=np.float32) / 255.0
             images = torch.from_numpy(images).permute(2, 0, 1).contiguous().float()
             images = rearrange(images, 'c (n h) (m w) -> (n m) c h w', n=3, m=2)
             from src.utils.camera_util import get_zero123plus_input_cameras
-            input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0).to(self.device)
-            render_cameras = self.get_render_cameras(batch_size=1, radius=4.5, elevation=20.0).to(self.device)
+            input_cameras = get_zero123plus_input_cameras(
+                batch_size=1, radius=4.0).to(self.device)
+            render_cameras = self.get_render_cameras(
+                batch_size=1, radius=4.5, elevation=20.0).to(self.device)
             images = images.unsqueeze(0).to(self.device)
-            images = v2.functional.resize(images, (320, 320), interpolation=3, antialias=True).clamp(0, 1)
+            images = v2.functional.resize(
+                images, (320, 320),
+                interpolation=3,
+                antialias=True
+            ).clamp(0, 1)
             with torch.no_grad():
                 planes = self.model.forward_planes(images, input_cameras)
                 frames = self.render_frames(render_cameras, planes)
@@ -166,12 +200,14 @@ class MemoryOptimizedInstantMesh:
             mesh_path = self.generate_mesh(planes)
             return video_path, mesh_path
         finally:
+            # Explicit cleanup
             del images, input_cameras, render_cameras, planes, frames
             torch.cuda.empty_cache()
             gc.collect()
             self.unload_model()
 
     def render_frames(self, render_cameras, planes):
+        """Render frames with chunked processing"""
         chunk_size = 20 if self.is_flexicubes else 1
         render_size = 384
         frames = []
@@ -194,10 +230,15 @@ class MemoryOptimizedInstantMesh:
         return torch.cat(frames, dim=1)
 
     def generate_mesh(self, planes):
+        """Generate mesh with memory optimization"""
         from src.utils.mesh_util import save_obj
         mesh_path = tempfile.NamedTemporaryFile(suffix=".obj", delete=False).name
         with torch.no_grad():
-            mesh_out = self.model.extract_mesh(planes, use_texture_map=False, **self.infer_config)
+            mesh_out = self.model.extract_mesh(
+                planes,
+                use_texture_map=False,
+                **self.infer_config,
+            )
             vertices, faces, vertex_colors = mesh_out
             vertices = vertices[:, [1, 2, 0]]
             vertices[:, -1] *= -1
@@ -206,6 +247,7 @@ class MemoryOptimizedInstantMesh:
         return mesh_path
 
     def save_video(self, frames, fps=30):
+        """Save video frames with memory cleanup"""
         video_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
         frames_np = []
         for i in range(frames.shape[0]):
@@ -215,12 +257,15 @@ class MemoryOptimizedInstantMesh:
         del frames_np
         return video_path
 
+
 #############################################
 # Gradio Demo Creation
 #############################################
 def create_demo(instant_mesh):
-    _HEADER_ = '''# InstantMesh: 2D Image to 3D Generation'''
-    
+    _HEADER_ = '''
+    # 3D Gen: Image to 3D Generation
+    '''
+
     def check_input_image(input_image):
         if input_image is None:
             raise gr.Error("No image uploaded!")
@@ -237,37 +282,115 @@ def create_demo(instant_mesh):
         with gr.Row(variant="panel"):
             with gr.Column():
                 with gr.Row():
-                    input_image = gr.Image(label="Input Image", image_mode="RGBA", width=256, height=256, type="pil")
-                    processed_image = gr.Image(label="Processed Image", image_mode="RGBA", width=256, height=256, type="pil", interactive=False)
+                    input_image = gr.Image(
+                        label="Input Image",
+                        image_mode="RGBA",
+                        width=256,
+                        height=256,
+                        type="pil",
+                        elem_id="content_image",
+                    )
+                    processed_image = gr.Image(
+                        label="Processed Image",
+                        image_mode="RGBA",
+                        width=256,
+                        height=256,
+                        type="pil",
+                        interactive=False
+                    )
                 with gr.Row():
                     with gr.Group():
-                        do_remove_background = gr.Checkbox(label="Remove Background", value=True)
-                        sample_seed = gr.Number(value=42, label="Seed Value", precision=0)
-                        sample_steps = gr.Slider(label="Sample Steps", minimum=30, maximum=75, value=75, step=5)
+                        do_remove_background = gr.Checkbox(
+                            label="Remove Background",
+                            value=True
+                        )
+                        sample_seed = gr.Number(
+                            value=42,
+                            label="Seed Value",
+                            precision=0
+                        )
+                        sample_steps = gr.Slider(
+                            label="Sample Steps",
+                            minimum=30,
+                            maximum=75,
+                            value=75,
+                            step=5
+                        )
                 with gr.Row():
-                    submit = gr.Button("Generate", variant="primary")
+                    submit = gr.Button(
+                        "Generate",
+                        elem_id="generate",
+                        variant="primary"
+                    )
+
             with gr.Column():
                 with gr.Row():
-                    mv_show_images = gr.Image(label="Generated Multi-views", type="pil", width=379, interactive=False)
-                    output_video = gr.Video(label="Video", format="mp4", width=379, autoplay=True, interactive=False)
+                    with gr.Column():
+                        mv_show_images = gr.Image(
+                            label="Generated Multi-views",
+                            type="pil",
+                            width=379,
+                            interactive=False
+                        )
+                    with gr.Column():
+                        output_video = gr.Video(
+                            label="Video",
+                            format="mp4",
+                            width=379,
+                            autoplay=True,
+                            interactive=False
+                        )
                 with gr.Row():
-                    output_model_obj = gr.Model3D(label="Output Model (OBJ)", interactive=False)
+                    output_model_obj = gr.Model3D(
+                        label="Output Model (OBJ Format)",
+                        interactive=False,
+                    )
 
+        # State for storing intermediate results
         mv_images = gr.State()
-        submit.click(fn=check_input_image, inputs=[input_image]).success(
-            fn=process_input, inputs=[input_image, do_remove_background], outputs=[processed_image]
+
+        # Main generation pipeline
+        submit.click(
+            fn=check_input_image,
+            inputs=[input_image]
         ).success(
-            fn=lambda x, y, z: instant_mesh.generate_mvs(x, y, z), inputs=[processed_image, sample_steps, sample_seed], outputs=[mv_images, mv_show_images]
+            fn=process_input,
+            inputs=[input_image, do_remove_background],
+            outputs=[processed_image],
         ).success(
-            fn=lambda x: instant_mesh.make3d(x), inputs=[mv_images], outputs=[output_video, output_model_obj]
+            fn=lambda x, y, z: instant_mesh.generate_mvs(x, y, z),
+            inputs=[processed_image, sample_steps, sample_seed],
+            outputs=[mv_images, mv_show_images],
+        ).success(
+            fn=lambda x: instant_mesh.make3d(x),
+            inputs=[mv_images],
+            outputs=[output_video, output_model_obj]
         )
+
     return demo
 
+
+#############################################
+# Main
+#############################################
 if __name__ == "__main__":
-    # Ensure config path is relative to the container structure
-    config_path = 'configs/instant-mesh-base.yaml'
-    instant_mesh = MemoryOptimizedInstantMesh(config_path=config_path)
+    # Ensure configs folder exists relative to this script
+    config_file = 'configs/instant-mesh-base.yaml'
+    
+    if not os.path.exists(config_file):
+        print(f"WARNING: Configuration file not found at {config_file}")
+        print("Ensure you are running this script from the root of the InstantMesh repository.")
+    
+    # Initialize InstantMesh
+    instant_mesh = MemoryOptimizedInstantMesh(config_path=config_file)
+    
+    # Create and launch the Gradio demo
     demo = create_demo(instant_mesh)
     demo.queue(max_size=10)
-    # Listen on all interfaces
-    demo.launch(server_name="0.0.0.0", server_port=43548)
+    
+    print("Launching Gradio Server on 0.0.0.0:43548")
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=43548,
+        share=False 
+    )
