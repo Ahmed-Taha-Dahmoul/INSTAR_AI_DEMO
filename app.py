@@ -37,15 +37,23 @@ class MemoryOptimizedInstantMesh:
     def load_pipeline(self):
         if self.pipeline is not None:
             return
+
         print("Loading Diffusion Pipeline...")
+
+        # Load the zero123plus pipeline from Hugging Face with trust_remote_code
         self.pipeline = DiffusionPipeline.from_pretrained(
             "sudo-ai/zero123plus-v1.2",
             custom_pipeline="zero123plus",
             torch_dtype=torch.float16,
+            trust_remote_code=True  # allow using the custom pipeline from repo
         )
+
+        # Set the scheduler
         self.pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
             self.pipeline.scheduler.config, timestep_spacing='trailing'
         )
+
+        # Load the UNet checkpoint from TencentARC/InstantMesh
         unet_ckpt_path = hf_hub_download(
             repo_id="TencentARC/InstantMesh",
             filename="diffusion_pytorch_model.bin",
@@ -53,7 +61,10 @@ class MemoryOptimizedInstantMesh:
         )
         state_dict = torch.load(unet_ckpt_path, map_location='cpu')
         self.pipeline.unet.load_state_dict(state_dict, strict=True)
+
+        # Move pipeline to GPU
         self.pipeline = self.pipeline.to(self.device)
+
 
     def unload_pipeline(self):
         if self.pipeline is not None:
