@@ -275,7 +275,15 @@ def create_demo(instant_mesh):
             rembg_session = rembg.new_session()
             input_image = instant_mesh.remove_background(input_image, rembg_session)
         input_image = instant_mesh.resize_foreground(input_image, 0.85)
-        return input_image
+        
+        # --- NEW CODE: Force White Background ---
+        # Create a pure white background
+        white_bg = Image.new("RGBA", input_image.size, (255, 255, 255, 255))
+        # Paste the object on top of the white background using the alpha channel as a mask
+        white_bg.paste(input_image, (0, 0), input_image)
+        # Convert to RGB (removes alpha channel completely)
+        return white_bg.convert("RGB")
+        # ----------------------------------------
 
     with gr.Blocks() as demo:
         gr.Markdown(_HEADER_)
