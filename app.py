@@ -46,7 +46,7 @@ class MemoryOptimizedInstantMesh:
         print("Loading Diffusion Pipeline...")
         self.pipeline = DiffusionPipeline.from_pretrained(
             "sudo-ai/zero123plus-v1.2",
-            custom_pipeline="zero123plus",
+            custom_pipeline="sudo-ai/zero123plus-v1.2",
             torch_dtype=torch.float16,
         )
         self.pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
